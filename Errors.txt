@@ -1,0 +1,2 @@
+Build failed:
+[6.09.2025 23:22:22, C:\ec2\Plugins\Source\CurrencyExchangeAutoFill\CurrencyExchangeAutoFill.cs(170, 74)] CS0117: 'Element „InventoryType” nie zawiera definicji „Currency”.
