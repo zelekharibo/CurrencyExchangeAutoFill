@@ -13,6 +13,7 @@ using ExileCore2.PoEMemory;
 using ExileCore2.PoEMemory.Components;
 using ExileCore2.PoEMemory.Elements;
 using ExileCore2.PoEMemory.Elements.InventoryElements;
+using ExileCore2.PoEMemory.Elements.Village;
 using ExileCore2.PoEMemory.MemoryObjects;
 using ExileCore2.Shared.Enums;
 using ImGuiNET;
@@ -42,7 +43,8 @@ namespace CurrencyExchangeAutoFill
         public override void Render()
         {
             var offeredItemCountInput = GameController.IngameState.IngameUi.CurrencyExchangePanel?.OfferedItemCountInput;
-            if (offeredItemCountInput == null || !GameController.IngameState.IngameUi.CurrencyExchangePanel.IsVisible || IsSelectorVisible()) {
+            if (offeredItemCountInput == null || GameController?.IngameState.IngameUi.CurrencyExchangePanel == null || !GameController.IngameState.IngameUi.CurrencyExchangePanel.IsVisible || IsSelectorVisible()) {
+                LogMessage("CurrencyExchangePanel not found or not visible");
                 return;
             }
             
@@ -59,6 +61,9 @@ namespace CurrencyExchangeAutoFill
             var imagePath = Path.Combine("pick.png").Replace('\\', '/');
             Graphics.DrawImage(imagePath, buttonRect);
 
+            // log where button is drawn
+            LogMessage($"Button drawn at {buttonRect.X}, {buttonRect.Y}");
+
             if (IsButtonPressed(buttonRect))
             {
                 _ = Task.Run(async () =>
@@ -66,27 +71,38 @@ namespace CurrencyExchangeAutoFill
                     // wait for mouse release before proceeding
                     while (Control.MouseButtons == MouseButtons.Left)
                     {
-                        await Task.Delay(10);
+                        await Task.Delay(100);
                     }
                 });
-                FillInputField();
+                _ = Task.Run(FillInputField);
             }
         }
 
         private async Task FillInputField() {
+            LogError("FillInputField");
+
             var currencyExchangePanel = GameController.IngameState.IngameUi.CurrencyExchangePanel;
             if (currencyExchangePanel == null || !currencyExchangePanel.IsVisible || IsSelectorVisible()) return;
 
             var offeredItemType = currencyExchangePanel.OfferedItemType;
-            if (offeredItemType == null) return;
+            if (offeredItemType == null) {
+                LogError("Offered item type not found");
+                return;
+            }
 
             var offeredItemCountInput = currencyExchangePanel.OfferedItemCountInput;
-            if (offeredItemCountInput == null) return;
+            var wantedItemCountInput = currencyExchangePanel.WantedItemCountInput;
+            if (offeredItemCountInput == null || wantedItemCountInput == null) {
+                LogError("Offered item count input or wanted item count input not found");
+                return;
+            }
 
-            var amountToInput = GetAmountToInput(offeredItemType);
-            if (amountToInput == 0) return;
+            if (!TryGetStockAndRatio(currencyExchangePanel, offeredItemType, out var offeredAmount, out var wantedAmount)) {
+                LogError("Failed to get stock and ratio");
+                return;
+            }
 
-            // click on the input field, type backspace 5 times and then type the amount
+            // click on the input field, clear it and type the offered amount
             await Mouse.MoveMouse(offeredItemCountInput.GetClientRectCache.TopRight + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
             await Mouse.LeftDown();
             await Mouse.LeftUp();
@@ -94,25 +110,20 @@ namespace CurrencyExchangeAutoFill
             {
                 await Keyboard.KeyPress(Keys.Back);
             }
-            await Keyboard.Type(amountToInput.ToString());
-            var wantedItemCountInput = currencyExchangePanel.WantedItemCountInput;
-            if (wantedItemCountInput == null) return;
+            await Keyboard.Type(offeredAmount.ToString());
+
+            // click on the wanted field, clear it and type the wanted amount
             await Mouse.MoveMouse(wantedItemCountInput.GetClientRectCache.TopRight + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
+            await Mouse.LeftDown();
+            await Mouse.LeftUp();
             await Mouse.LeftDown();
             await Mouse.LeftUp();
             for (int i = 0; i < 6; i++)
             {
                 await Keyboard.KeyPress(Keys.Back);
             }
-            await Mouse.MoveMouse(wantedItemCountInput.GetClientRectCache.TopRight + new Vector2(5, 0) + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
-            await Mouse.LeftDown();
-            await Mouse.LeftUp();
-            await Mouse.MoveMouse(wantedItemCountInput.GetClientRectCache.TopRight + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
-            await Mouse.LeftDown();
-            await Mouse.LeftUp();
-            await Mouse.MoveMouse(wantedItemCountInput.GetClientRectCache.TopRight + new Vector2(5, 0) + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
-            await Mouse.LeftDown();
-            await Mouse.LeftUp();
+            await Keyboard.Type(wantedAmount.ToString());
+
             var placeOrderButton = GetPlaceOrderButton();
             if (placeOrderButton == null) return;
             await Mouse.MoveMouse(placeOrderButton.GetClientRectCache.Center + GameController.Window.GetWindowRectangleTimeCache.TopLeft);
@@ -144,44 +155,190 @@ namespace CurrencyExchangeAutoFill
             return false;
         }
 
-        private static readonly HashSet<string> AllowedInventoryTypes = new HashSet<string>
+        private bool TryGetStockAndRatio(CurrencyExchangePanel currencyExchangePanel,
+            ExileCore2.PoEMemory.Models.BaseItemType offeredItemType,
+            out int offeredAmount,
+            out int wantedAmount)
         {
-            "Essence", "Delirium", "Gem", "Currency", "62"
-        };
+            offeredAmount = 0;
+            wantedAmount = 0;
 
-        private int GetAmountToInput(ExileCore2.PoEMemory.Models.BaseItemType offeredItemType)
-        {
-            int amount = 0;
-            var processedInventories = new HashSet<string>();
-            var targetBaseName = offeredItemType.BaseName;
-            
-            foreach (var playerInventory in GameController.IngameState.Data.ServerData.PlayerInventories) 
+            // compare both OfferedItemStock and WantedItemStock to find best ratio
+            int offerPart = 0;
+            int wantPart = 0;
+            double bestValue = 0.0;
+
+            // check OfferedItemStock
+            var offeredItemStock = currencyExchangePanel.OfferedItemStock;
+            if (offeredItemStock != null && offeredItemStock.Count > 0)
             {
-                var inventory = playerInventory?.Inventory;
-                if (inventory?.Items == null) continue;
-                
-                // avoid double counting with unique inventory key
-                var inventoryKey = $"{inventory.InventType}_{inventory.Address}";
-                if (!processedInventories.Add(inventoryKey)) continue;
-                
-                // skip numeric inventory types (temporary/cached) and non-stash inventories
-                var inventoryTypeString = inventory.InventType.ToString();
-                if (!AllowedInventoryTypes.Contains(inventoryTypeString))
-                    continue;
-                
-                foreach (var item in inventory.Items) 
+                dynamic firstOfferedStock = offeredItemStock[0];
+                if (firstOfferedStock != null)
                 {
-                    if (item == null) continue;
-                    
-                    var baseItemType = GameController.Files.BaseItemTypes.Translate(item.Metadata);
-                    if (baseItemType?.BaseName == targetBaseName) 
+                    int offerPart1 = firstOfferedStock.Get;
+                    int wantPart1 = firstOfferedStock.Give;
+                    if (offerPart1 > 0 && wantPart1 > 0)
                     {
-                        amount += item.GetComponent<Stack>()?.Size ?? 1;
+                        double value1 = (double)wantPart1 / offerPart1;
+                        if (value1 > bestValue)
+                        {
+                            bestValue = value1;
+                            offerPart = offerPart1;
+                            wantPart = wantPart1;
+                        }
                     }
                 }
             }
-            
-            return amount;
+
+            // check WantedItemStock
+            var wantedItemStock = currencyExchangePanel.WantedItemStock;
+            if (wantedItemStock != null && wantedItemStock.Count > 0)
+            {
+                dynamic firstWantedStock = wantedItemStock[0];
+                if (firstWantedStock != null)
+                {
+                    int offerPart2 = firstWantedStock.Give;
+                    int wantPart2 = firstWantedStock.Get;
+                    if (offerPart2 > 0 && wantPart2 > 0)
+                    {
+                        double value2 = (double)wantPart2 / offerPart2;
+                        if (value2 > bestValue)
+                        {
+                            bestValue = value2;
+                            offerPart = offerPart2;
+                            wantPart = wantPart2;
+                        }
+                    }
+                }
+            }
+
+            if (offerPart <= 0 || wantPart <= 0) {
+                LogError("No valid ratio found in either OfferedItemStock or WantedItemStock");
+                return false;
+            }
+
+            var stock = GetAvailableOfferedStock(offeredItemType);
+
+            if (stock <= 0)
+            {
+                LogError($"No stock found for offered item '{offeredItemType.BaseName}' in the visible stash");
+                return false;
+            }
+
+            // use all available stock and round the wanted side down to preserve ratio as closely as possible
+            offeredAmount = stock;
+            if (offerPart <= 0 || wantPart <= 0)
+            {
+                LogError("Invalid offer/want parts when computing rounded ratio");
+                return false;
+            }
+
+            var wantedExact = (double)stock * wantPart / offerPart;
+            wantedAmount = (int)Math.Ceiling(wantedExact);
+
+            if (offeredAmount <= 0 || wantedAmount <= 0) {
+                LogError("Offered amount or wanted amount not found");
+                return false;
+            }
+
+            LogError($"Offered amount: {offeredAmount}, Wanted amount: {wantedAmount}");
+
+            return true;
+        }
+
+        private int GetAvailableOfferedStock(ExileCore2.PoEMemory.Models.BaseItemType offeredItemType)
+        {
+            if (offeredItemType == null)
+            {
+                return 0;
+            }
+
+            var stock = GetVisibleStashStock(offeredItemType);
+            if (stock > 0)
+            {
+                LogError($"Found {stock}x {offeredItemType.BaseName} in visible stash");
+                return stock;
+            }
+
+            stock = GetPlayerInventoryStock(offeredItemType);
+            if (stock > 0)
+            {
+                LogError($"Found {stock}x {offeredItemType.BaseName} in player inventories");
+            }
+
+            return stock;
+        }
+
+        private int GetVisibleStashStock(ExileCore2.PoEMemory.Models.BaseItemType offeredItemType)
+        {
+            var visibleStashItems = GameController?.IngameState?.IngameUi?.StashElement?.VisibleStash?.VisibleInventoryItems;
+            if (visibleStashItems == null)
+            {
+                return 0;
+            }
+
+            var stock = 0;
+            foreach (var item in visibleStashItems)
+            {
+                if (item?.Item == null || !IsMatchingItemType(item.Item.Metadata, offeredItemType))
+                {
+                    continue;
+                }
+
+                stock += item.Item.GetComponent<Stack>()?.Size ?? 1;
+            }
+
+            return stock;
+        }
+
+        private int GetPlayerInventoryStock(ExileCore2.PoEMemory.Models.BaseItemType offeredItemType)
+        {
+            var playerInventories = GameController?.IngameState?.ServerData?.PlayerInventories;
+            if (playerInventories == null)
+            {
+                return 0;
+            }
+
+            var stock = 0;
+            var processedInventories = new HashSet<string>();
+
+            foreach (var playerInventory in playerInventories)
+            {
+                var inventory = playerInventory?.Inventory;
+                if (inventory?.Items == null || playerInventory?.Id == 46) // ritual reward window
+                {
+                    continue;
+                }
+
+                var inventoryKey = $"{inventory.InventType}_{inventory.Address}";
+                if (!processedInventories.Add(inventoryKey))
+                {
+                    continue;
+                }
+
+                foreach (var item in inventory.Items)
+                {
+                    if (item == null || !IsMatchingItemType(item.Metadata, offeredItemType))
+                    {
+                        continue;
+                    }
+
+                    stock += item.GetComponent<Stack>()?.Size ?? 1;
+                }
+            }
+
+            return stock;
+        }
+
+        private bool IsMatchingItemType(string metadata, ExileCore2.PoEMemory.Models.BaseItemType offeredItemType)
+        {
+            if (string.IsNullOrEmpty(metadata) || offeredItemType == null)
+            {
+                return false;
+            }
+
+            var baseItemType = GameController.Files.BaseItemTypes.Translate(metadata);
+            return string.Equals(baseItemType?.BaseName, offeredItemType.BaseName, StringComparison.OrdinalIgnoreCase);
         }
 
         private bool IsButtonPressed(RectangleF buttonRect)
